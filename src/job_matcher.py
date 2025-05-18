@@ -425,7 +425,7 @@ def main():
     parser.add_argument("--output-format", type=str, default="json", choices=["json", "txt"],
                       help="Output format (json or txt)")
     parser.add_argument("--top-k", type=int, default=5, help="Number of top matches to return")
-    parser.add_argument("--min-similarity", type=float, default=0.3, 
+    parser.add_argument("--min-similarity", type=float, default=0.25, 
                       help="Minimum similarity threshold (0.0 to 1.0)")
     
     args = parser.parse_args()
