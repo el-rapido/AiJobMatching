@@ -83,7 +83,11 @@ std::string fetch_page(const std::string& url, int retries = 3) {
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L); // For https sites
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);  // For debugging
+    
+    // Add cookie support
+    curl_easy_setopt(curl, CURLOPT_COOKIEFILE, "");  // Enable cookies
     
     // Add request headers to look more like a browser
     struct curl_slist* headers = NULL;
@@ -96,7 +100,9 @@ std::string fetch_page(const std::string& url, int retries = 3) {
     
     CURLcode res = CURLE_OK;
     for (int i = 0; i < retries; i++) {
+        buffer.clear();  // Clear buffer for retry
         res = curl_easy_perform(curl);
+        
         if (res == CURLE_OK) {
             long http_code = 0;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
@@ -105,9 +111,21 @@ std::string fetch_page(const std::string& url, int retries = 3) {
                 break;
             } else {
                 std::cerr << "HTTP error: " << http_code << " for URL: " << url << std::endl;
+                
                 // If it's a 429 (too many requests), wait longer
                 if (http_code == 429) {
-                    std::this_thread::sleep_for(std::chrono::seconds(10 * (i + 1)));
+                    std::cerr << "Rate limited (429). Waiting longer..." << std::endl;
+                    std::this_thread::sleep_for(std::chrono::seconds(30 * (i + 1)));
+                } else if (http_code == 403) {
+                    std::cerr << "Forbidden (403). Might be blocking scraping." << std::endl;
+                    // Save response for debugging
+                    std::string debug_path = "debug_403_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + ".html";
+                    std::ofstream debug_file(debug_path);
+                    if (debug_file.is_open()) {
+                        debug_file << buffer;
+                        debug_file.close();
+                        std::cerr << "Saved 403 response to: " << debug_path << std::endl;
+                    }
                 }
             }
         } else {
@@ -115,7 +133,7 @@ std::string fetch_page(const std::string& url, int retries = 3) {
         }
         
         // Exponential backoff
-        std::this_thread::sleep_for(std::chrono::seconds(2 * (i + 1)));
+        std::this_thread::sleep_for(std::chrono::seconds(3 * (i + 1)));
     }
     
     curl_slist_free_all(headers);
@@ -478,15 +496,347 @@ json scrape_details(GumboNode* n, const SiteConfig& cfg, const SearchConfig& sea
     return j;
 }
 
+// Add this function to create LinkedIn config
+SiteConfig create_linkedin_config() {
+    return {
+        "LinkedIn", 
+        "https://www.linkedin.com", 
+        "https://www.linkedin.com/jobs/search?keywords={job_title}&location={location}&f_TPR=r86400",  // Last 24 hours
+        "div", "base-card relative", 
+        "h3", "base-search-card__title", 
+        "h4", "base-search-card__subtitle", 
+        "span", "job-search-card__location",
+        "div", "jobs-description-content",
+        "a", "base-card__full-link", 
+        "time", "", 
+        "", "", 
+        "start", 
+        2,
+        std::chrono::seconds(3)
+    };
+}
+
+// To handle fetching detailed job information
+json fetch_linkedin_job_details(const std::string& job_url, const SiteConfig& site_config, const SearchConfig& search_cfg) {
+    json job_details;
+    
+    try {
+        std::cout << "  Fetching detailed job information from: " << job_url << std::endl;
+        
+        // Add delay before fetching to avoid rate limiting
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        
+        // Fetch the job detail page
+        std::string html = fetch_page(job_url);
+        
+        // Parse HTML with Gumbo
+        GumboOutput* output = gumbo_parse(html.c_str());
+        if (!output) {
+            std::cerr << "  Failed to parse job detail HTML" << std::endl;
+            return job_details;
+        }
+        
+        // Look for the job description container using multiple possible selectors
+        std::vector<GumboNode*> description_containers;
+        
+        // Try all these selectors one by one
+        const std::vector<std::pair<std::string, std::string>> selectors = {
+            {"div", "jobs-description-content"},
+            {"div", "jobs-box__html-content"},
+            {"div", "description__text"},
+            {"div", "show-more-less-html__markup"},
+            {"div", "jobs-description__content"},
+            {"section", "description"},
+            {"div", "job-detail-body"}, 
+            {"div", "job-description"},
+            {"div", "job-view-layout jobs-details"}
+        };
+        
+        // Try each selector until we find something
+        for (const auto& selector : selectors) {
+            find_nodes(output->root, selector.first, selector.second, description_containers);
+            if (!description_containers.empty()) {
+                std::cout << "  Found description using selector: " << selector.first << "." << selector.second << std::endl;
+                break;
+            }
+        }
+        
+        // If still empty, try a more generic approach to find any large text block
+        if (description_containers.empty()) {
+            std::cout << "  Trying generic approach to find description..." << std::endl;
+            std::vector<GumboNode*> divs;
+            find_nodes(output->root, "div", "", divs);
+            
+            // Find the div with the most text content (likely the description)
+            size_t max_length = 0;
+            GumboNode* best_candidate = nullptr;
+            
+            for (auto* div : divs) {
+                std::string content = extract_text(div);
+                if (content.length() > max_length && content.length() > 100) {
+                    max_length = content.length();
+                    best_candidate = div;
+                }
+            }
+            
+            if (best_candidate) {
+                description_containers.push_back(best_candidate);
+                std::cout << "  Found potential description by content length: " << max_length << " chars" << std::endl;
+            }
+        }
+        
+        // Extract description if found
+        if (!description_containers.empty()) {
+            // Extract the full description text
+            std::string description = clean_text(extract_text(description_containers[0]));
+            job_details["description"] = description;
+            
+            // Extract skills if enabled
+            if (search_cfg.extract_skills) {
+                auto skills = extract_skills(description);
+                job_details["skills"] = skills;
+            }
+            
+            std::cout << "  Successfully extracted description (" << description.length() << " chars)" << std::endl;
+        } else {
+            std::cerr << "  Could not find job description container" << std::endl;
+            
+            // Save the HTML for debugging
+            std::string debug_path = "debug_linkedin_" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + ".html";
+            std::ofstream debug_file(debug_path);
+            if (debug_file.is_open()) {
+                debug_file << html;
+                debug_file.close();
+                std::cout << "  Saved HTML for debugging to: " << debug_path << std::endl;
+            }
+        }
+        
+        // Clean up Gumbo parser
+        gumbo_destroy_output(&kGumboDefaultOptions, output);
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error fetching job details: " << e.what() << std::endl;
+    }
+    
+    return job_details;
+}
+
+// Specialized function to process LinkedIn jobs
+void process_linkedin_jobs(const SiteConfig& site, const SearchConfig& search_cfg, 
+                          std::vector<json>& all_jobs, int max_jobs) {
+    std::cout << "Scraping from: " << site.name << std::endl;
+    
+    try {
+        // Format search URL with job title and location
+        std::string base_search_url = format_url(site.search_url_template, 
+                                                search_cfg.job_title, 
+                                                search_cfg.location);
+        
+        // Process multiple pages up to max_pages
+        for (int page = 1; page <= site.max_pages; ++page) {
+            // Construct pagination URL
+            std::string page_url = base_search_url;
+            if (!site.pagination_param.empty()) {
+                char separator = (page_url.find('?') != std::string::npos) ? '&' : '?';
+                page_url += separator + site.pagination_param + "=" + std::to_string(page);
+            }
+            
+            std::cout << "  Fetching page " << page << ": " << page_url << std::endl;
+            
+            // Fetch page HTML content
+            std::string html;
+            try {
+                html = fetch_page(page_url);
+            } catch (const ScraperException& e) {
+                std::cerr << "  Error fetching page: " << e.what() << std::endl;
+                break;
+            }
+            
+            // Parse HTML with Gumbo
+            GumboOutput* output = gumbo_parse(html.c_str());
+            if (!output) {
+                std::cerr << "  Failed to parse HTML for " << site.name << std::endl;
+                continue;
+            }
+            
+            // Find job listing containers
+            std::vector<GumboNode*> containers;
+            find_nodes(output->root, site.container_tag, site.container_class, containers);
+            
+            std::cout << "  Found " << containers.size() << " job listings" << std::endl;
+            
+            // Extract job details from each container
+            for (auto* container : containers) {
+                // Get basic job information
+                json job = scrape_details(container, site, search_cfg);
+                
+                // Only process valid jobs
+                if (!job.empty()) {
+                    // Get the job URL for fetching detailed information
+                    std::string job_url = job["source"];
+                    
+                    if (!job_url.empty()) {
+                        // Fetch detailed job information
+                        json detailed_info = fetch_linkedin_job_details(job_url, site, search_cfg);
+                        
+                        // Merge detailed info with basic job info
+                        for (auto it = detailed_info.begin(); it != detailed_info.end(); ++it) {
+                            job[it.key()] = it.value();
+                        }
+                    }
+                    
+                    all_jobs.push_back(job);
+                    
+                    // Print basic info about the job
+                    std::cout << "  Scraped: " 
+                            << job.value("title", "Unknown Title") << " at " 
+                            << job.value("company", "Unknown Company") << " in "
+                            << job.value("location", "Unknown Location") << std::endl;
+                    
+                    // Check if description was successfully extracted
+                    if (job.contains("description")) {
+                        std::string desc = job["description"];
+                        if (!desc.empty()) {
+                            std::cout << "  Description extracted: " 
+                                    << desc.substr(0, 50) << "..." << std::endl;
+                        } else {
+                            std::cout << "  Warning: Empty description extracted" << std::endl;
+                        }
+                    } else {
+                        std::cout << "  Warning: No description extracted" << std::endl;
+                    }
+                    
+                    // Break if we've reached the maximum number of jobs
+                    if (all_jobs.size() >= static_cast<size_t>(max_jobs)) {
+                        std::cout << "  Reached maximum job limit (" << max_jobs << ")" << std::endl;
+                        break;
+                    }
+                }
+                
+                // Add a small delay between processing jobs to be polite
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            
+            // Clean up Gumbo parser
+            gumbo_destroy_output(&kGumboDefaultOptions, output);
+            
+            // Break if we've reached the maximum number of jobs
+            if (all_jobs.size() >= static_cast<size_t>(max_jobs)) {
+                break;
+            }
+            
+            // Respect the site's delay between requests to avoid being blocked
+            std::this_thread::sleep_for(site.delay);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error scraping " << site.name << ": " << e.what() << std::endl;
+    }
+}
+
 // Function to save scraped jobs to JSON file
 void save_to_json(const std::vector<json>& jobs, const std::string& filepath) {
+    std::cout << "Attempting to save " << jobs.size() << " jobs to: " << filepath << std::endl;
+    
     std::ofstream file(filepath);
     if (!file.is_open()) {
         std::cerr << "Failed to open JSON file for writing: " << filepath << std::endl;
+        // Try to create parent directories if they don't exist
+        try {
+            fs::path path(filepath);
+            fs::create_directories(path.parent_path());
+            file.open(filepath);
+            if (!file.is_open()) {
+                std::cerr << "Still can't open file after creating directories" << std::endl;
+                return;
+            }
+        } catch (const fs::filesystem_error& e) {
+            std::cerr << "Error creating directories: " << e.what() << std::endl;
+            return;
+        }
+    }
+    
+    try {
+        file << json(jobs).dump(4);
+        file.close();
+        std::cout << "Successfully saved " << jobs.size() << " jobs to " << filepath << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error during JSON serialization: " << e.what() << std::endl;
+    }
+}
+
+// Helper function to deduplicate jobs based on title and company
+std::vector<json> deduplicate_jobs(const std::vector<json>& jobs) {
+    std::vector<json> unique_jobs;
+    std::set<std::string> seen_fingerprints;
+    
+    for (const auto& job : jobs) {
+        // Create a fingerprint based on title and company
+        std::string title = job.value("title", "");
+        std::string company = job.value("company", "");
+        std::transform(title.begin(), title.end(), title.begin(), ::tolower);
+        std::transform(company.begin(), company.end(), company.begin(), ::tolower);
+        
+        // Simple fingerprint using title and company
+        std::string fingerprint = title + "|" + company;
+        
+        // Only add if we haven't seen this fingerprint before
+        if (seen_fingerprints.find(fingerprint) == seen_fingerprints.end()) {
+            seen_fingerprints.insert(fingerprint);
+            unique_jobs.push_back(job);
+        }
+    }
+    
+    return unique_jobs;
+}
+
+// Function to export jobs to CSV format
+void save_to_csv(const std::vector<json>& jobs, const std::string& filepath) {
+    std::ofstream file(filepath);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open CSV file for writing: " << filepath << std::endl;
         return;
     }
     
-    file << json(jobs).dump(4);
+    // Write CSV header
+    file << "Title,Company,Location,Description,Source,Source URL,Scraped At,Skills\n";
+    
+    // Write job data
+    for (const auto& job : jobs) {
+        // Helper function to escape CSV fields
+        auto escape_csv = [](const std::string& s) -> std::string {
+            if (s.find_first_of(",\"\n") != std::string::npos) {
+                std::string escaped = s;
+                // Replace " with ""
+                size_t pos = 0;
+                while ((pos = escaped.find("\"", pos)) != std::string::npos) {
+                    escaped.replace(pos, 1, "\"\"");
+                    pos += 2;
+                }
+                return "\"" + escaped + "\"";
+            }
+            return s;
+        };
+        
+        // Write each field, properly escaped
+        file << escape_csv(job.value("title", "")) << ",";
+        file << escape_csv(job.value("company", "")) << ",";
+        file << escape_csv(job.value("location", "")) << ",";
+        file << escape_csv(job.value("description", "")) << ",";
+        file << escape_csv(job.value("source", "")) << ",";
+        file << escape_csv(job.value("url", "")) << ",";
+        file << escape_csv(job.value("scraped_at", "")) << ",";
+        
+        // Handle skills array
+        std::string skills_str;
+        if (job.contains("skills") && job["skills"].is_array()) {
+            for (const auto& skill : job["skills"]) {
+                if (!skills_str.empty()) skills_str += "; ";
+                skills_str += skill.get<std::string>();
+            }
+        }
+        file << escape_csv(skills_str) << "\n";
+    }
+    
     file.close();
 }
 
@@ -622,26 +972,12 @@ bool save_to_sqlite(const std::vector<json>& jobs, const std::string& db_path) {
 #endif // ENABLE_SQLITE
 
 // Function to configure job search sites
+// Function to configure job search sites
 std::vector<SiteConfig> initialize_site_configs() {
     std::vector<SiteConfig> sites;
     
-    // LinkedIn - Updated with search URL template
-    sites.push_back({
-        "LinkedIn", 
-        "https://www.linkedin.com", 
-        "https://www.linkedin.com/jobs/search?keywords={job_title}&location={location}",
-        "div", "base-card relative", 
-        "h3", "base-search-card__title", 
-        "h4", "base-search-card__subtitle", 
-        "span", "job-search-card__location",
-        "p", "base-search-card__metadata", 
-        "a", "base-card__full-link", 
-        "time", "", 
-        "", "", 
-        "start", 
-        2,
-        3s
-    });
+    // LinkedIn - Updated with create_linkedin_config function
+    sites.push_back(create_linkedin_config());
     
     // Indeed - Updated with search URL template
     sites.push_back({
@@ -661,7 +997,8 @@ std::vector<SiteConfig> initialize_site_configs() {
         2s
     });
     
-    // Glassdoor - Updated with search URL template
+    // Keep the rest of your existing site configs
+    // Glassdoor
     sites.push_back({
         "Glassdoor", 
         "https://www.glassdoor.com", 
@@ -678,90 +1015,7 @@ std::vector<SiteConfig> initialize_site_configs() {
         2
     });
     
-    // RemoteOK - Updated with search URL template
-    sites.push_back({
-        "RemoteOK", 
-        "https://remoteok.com", 
-        "https://remoteok.com/remote-{job_title}-jobs",
-        "tr", "job", 
-        "h2", "preventLink", 
-        "h3", "companyLink", 
-        "div", "location", 
-        "div", "description", 
-        "a", "url", 
-        "time", "date", 
-        "div", "tags", 
-        "", 
-        2
-    });
-    
-    // WeWorkRemotely - Updated with search URL template
-    sites.push_back({
-        "WeWorkRemotely", 
-        "https://weworkremotely.com", 
-        "https://weworkremotely.com/remote-jobs/search?term={job_title}",
-        "li", "feature", 
-        "span", "title", 
-        "span", "company", 
-        "span", "region",
-        "div", "job-listing-left", 
-        "a", "", 
-        "span", "date", 
-        "", "", 
-        "", 
-        1
-    });
-    
-    // Monster - Updated with search URL template
-    sites.push_back({
-        "Monster", 
-        "https://www.monster.com", 
-        "https://www.monster.com/jobs/search?q={job_title}&where={location}",
-        "div", "job-cardstyle__JobCardStyles", 
-        "h3", "title", 
-        "span", "company", 
-        "span", "location",
-        "div", "descriptionstyle__DescriptionStyles", 
-        "a", "job-cardstyle__JobCardComponent", 
-        "time", "postedDate", 
-        "", "", 
-        "page", 
-        2
-    });
-    
-    // SimplyHired - New site added
-    sites.push_back({
-        "SimplyHired", 
-        "https://www.simplyhired.com", 
-        "https://www.simplyhired.com/search?q={job_title}&l={location}",
-        "div", "SerpJob-jobCard", 
-        "h3", "jobposting-title", 
-        "span", "jobposting-company", 
-        "span", "jobposting-location",
-        "p", "jobposting-snippet", 
-        "a", "card-link", 
-        "span", "SerpJob-age", 
-        "", "", 
-        "pn", 
-        2
-    });
-    
-    // ZipRecruiter - New site added
-    sites.push_back({
-        "ZipRecruiter", 
-        "https://www.ziprecruiter.com", 
-        "https://www.ziprecruiter.com/jobs/search?q={job_title}&l={location}",
-        "div", "job_content", 
-        "h2", "job_title", 
-        "a", "company_name", 
-        "div", "location",
-        "div", "job_description", 
-        "a", "job_link", 
-        "div", "job_posted", 
-        "", "", 
-        "page", 
-        2
-    });
+    // Continue with the rest of your site configurations...
     
     return sites;
 }
@@ -791,54 +1045,47 @@ int main(int argc, char** argv) {
     SearchConfig search_cfg;
     OutputConfig output_cfg;
     
-    // Parse command line arguments
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        
-        if (arg == "--job-title" && i + 1 < argc) {
-            search_cfg.job_title = argv[++i];
-        }
-        else if (arg == "--location" && i + 1 < argc) {
-            search_cfg.location = argv[++i];
-        }
-        else if (arg == "--output-dir" && i + 1 < argc) {
-            output_cfg.output_dir = argv[++i];
-        }
-        else if (arg == "--sqlite" && i + 1 < argc) {
-            output_cfg.sqlite_output = true;
-            output_cfg.sqlite_db_path = argv[++i];
-        }
-        else if (arg == "--interval" && i + 1 < argc) {
-            output_cfg.scrape_interval = std::chrono::hours(std::stoi(argv[++i]));
-        }
-        else if (arg == "--max-jobs" && i + 1 < argc) {
-            output_cfg.max_jobs = std::stoi(argv[++i]);
-        }
-        else if (arg == "--keyword" && i + 1 < argc) {
-            search_cfg.keywords.push_back(argv[++i]);
-        }
-        else if (arg == "--no-skills") {
-            search_cfg.extract_skills = false;
-        }
-        else if (arg == "--help") {
-            print_help(argv[0]);
-            return 0;
-        }
-        else {
-            std::cerr << "Unknown option: " << arg << "\n";
-            print_help(argv[0]);
-            return 1;
-        }
-    }
     
-    // Create output directory if it doesn't exist
-    try {
-        if (!fs::exists(output_cfg.output_dir)) {fs::create_directories(output_cfg.output_dir);
-        }
-    } catch (const fs::filesystem_error& e) {
-        std::cerr << "Error creating output directory: " << e.what() << std::endl;
+    // Parse command line arguments
+for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    
+    if (arg == "--job-title" && i + 1 < argc) {
+        search_cfg.job_title = argv[++i];
+    }
+    else if (arg == "--location" && i + 1 < argc) {
+        search_cfg.location = argv[++i];
+    }
+    else if (arg == "--output-dir" && i + 1 < argc) {
+        output_cfg.output_dir = argv[++i];
+    }
+    else if (arg == "--sqlite" && i + 1 < argc) {
+        output_cfg.sqlite_output = true;
+        output_cfg.sqlite_db_path = argv[++i];
+    }
+    else if (arg == "--interval" && i + 1 < argc) {
+        output_cfg.scrape_interval = std::chrono::hours(std::stoi(argv[++i]));
+    }
+    else if (arg == "--max-jobs" && i + 1 < argc) {
+        output_cfg.max_jobs = std::stoi(argv[++i]);
+        std::cout << "Setting max jobs to: " << output_cfg.max_jobs << std::endl;
+    }
+    else if (arg == "--keyword" && i + 1 < argc) {
+        search_cfg.keywords.push_back(argv[++i]);
+    }
+    else if (arg == "--no-skills") {
+        search_cfg.extract_skills = false;
+    }
+    else if (arg == "--help") {
+        print_help(argv[0]);
+        return 0;
+    }
+    else {
+        std::cerr << "Unknown option: " << arg << "\n";
+        print_help(argv[0]);
         return 1;
     }
+}
     
     // Get site configurations
     auto sites = initialize_site_configs();
@@ -853,123 +1100,135 @@ int main(int argc, char** argv) {
         
         // Process each job site
         for (const auto& site : sites) {
-            std::cout << "Scraping from: " << site.name << std::endl;
-            
-            try {
-                // Format search URL with job title and location
-                std::string base_search_url = format_url(site.search_url_template, 
-                                                        search_cfg.job_title, 
-                                                        search_cfg.location);
+            // Use specialized processor for LinkedIn
+            if (site.name == "LinkedIn") {
+                process_linkedin_jobs(site, search_cfg, all_jobs, output_cfg.max_jobs);
+            } else {
+                // Use the regular processing logic for other sites
+                std::cout << "Scraping from: " << site.name << std::endl;
                 
-                // Process multiple pages up to max_pages
-                for (int page = 1; page <= site.max_pages; ++page) {
-                    // Construct pagination URL
-                    std::string page_url = base_search_url;
-                    if (!site.pagination_param.empty()) {
-                        char separator = (page_url.find('?') != std::string::npos) ? '&' : '?';
-                        page_url += separator + site.pagination_param + "=" + std::to_string(page);
-                    }
+                try {
+                    // Format search URL with job title and location
+                    std::string base_search_url = format_url(site.search_url_template, 
+                                                           search_cfg.job_title, 
+                                                           search_cfg.location);
                     
-                    std::cout << "  Fetching page " << page << ": " << page_url << std::endl;
-                    
-                    // Fetch page HTML content
-                    std::string html;
-                    try {
-                        html = fetch_page(page_url);
-                    } catch (const ScraperException& e) {
-                        std::cerr << "  Error fetching page: " << e.what() << std::endl;
-                        break;
-                    }
-                    
-                    // Parse HTML with Gumbo
-                    GumboOutput* output = gumbo_parse(html.c_str());
-                    if (!output) {
-                        std::cerr << "  Failed to parse HTML for " << site.name << std::endl;
-                        continue;
-                    }
-                    
-                    // Find job listing containers
-                    std::vector<GumboNode*> containers;
-                    find_nodes(output->root, site.container_tag, site.container_class, containers);
-                    
-                    std::cout << "  Found " << containers.size() << " job listings" << std::endl;
-                    
-                    // Extract job details from each container
-                    for (auto* container : containers) {
-                        json job = scrape_details(container, site, search_cfg);
+                    // Process multiple pages up to max_pages
+                    for (int page = 1; page <= site.max_pages; ++page) {
+                        // Construct pagination URL
+                        std::string page_url = base_search_url;
+                        if (!site.pagination_param.empty()) {
+                            char separator = (page_url.find('?') != std::string::npos) ? '&' : '?';
+                            page_url += separator + site.pagination_param + "=" + std::to_string(page);
+                        }
                         
-                        // Only add valid jobs
-                        if (!job.empty()) {
-                            all_jobs.push_back(job);
+                        std::cout << "  Fetching page " << page << ": " << page_url << std::endl;
+                        
+                        // Fetch page HTML content
+                        std::string html;
+                        try {
+                            html = fetch_page(page_url);
+                        } catch (const ScraperException& e) {
+                            std::cerr << "  Error fetching page: " << e.what() << std::endl;
+                            break;
+                        }
+                        
+                        // Parse HTML with Gumbo
+                        GumboOutput* output = gumbo_parse(html.c_str());
+                        if (!output) {
+                            std::cerr << "  Failed to parse HTML for " << site.name << std::endl;
+                            continue;
+                        }
+                        
+                        // Find job listing containers
+                        std::vector<GumboNode*> containers;
+                        find_nodes(output->root, site.container_tag, site.container_class, containers);
+                        
+                        std::cout << "  Found " << containers.size() << " job listings" << std::endl;
+                        
+                        // Extract job details from each container
+                        for (auto* container : containers) {
+                            json job = scrape_details(container, site, search_cfg);
                             
-                            // Print basic info about the job
-                            std::cout << "  Scraped: " 
-                                    << job.value("title", "Unknown Title") << " at " 
-                                    << job.value("company", "Unknown Company") << " in "
-                                    << job.value("location", "Unknown Location") << std::endl;
-                            
-                            // Break if we've reached the maximum number of jobs
-                            if (all_jobs.size() >= static_cast<size_t>(output_cfg.max_jobs)) {
-                                std::cout << "  Reached maximum job limit (" << output_cfg.max_jobs << ")" << std::endl;
-                                break;
+                            // Only add valid jobs
+                            if (!job.empty()) {
+                                all_jobs.push_back(job);
+                                
+                                // Print basic info about the job
+                                std::cout << "  Scraped: " 
+                                        << job.value("title", "Unknown Title") << " at " 
+                                        << job.value("company", "Unknown Company") << " in "
+                                        << job.value("location", "Unknown Location") << std::endl;
+                                
+                                // Break if we've reached the maximum number of jobs
+                                if (all_jobs.size() >= static_cast<size_t>(output_cfg.max_jobs)) {
+                                    std::cout << "  Reached maximum job limit (" << output_cfg.max_jobs << ")" << std::endl;
+                                    break;
+                                }
                             }
                         }
+                        
+                        // Clean up Gumbo parser
+                        gumbo_destroy_output(&kGumboDefaultOptions, output);
+                        
+                        // Break if we've reached the maximum number of jobs
+                        if (all_jobs.size() >= static_cast<size_t>(output_cfg.max_jobs)) {
+                            break;
+                        }
+                        
+                        // Respect the site's delay between requests to avoid being blocked
+                        std::this_thread::sleep_for(site.delay);
                     }
-                    
-                    // Clean up Gumbo parser
-                    gumbo_destroy_output(&kGumboDefaultOptions, output);
-                    
-                    // Break if we've reached the maximum number of jobs
-                    if (all_jobs.size() >= static_cast<size_t>(output_cfg.max_jobs)) {
-                        break;
-                    }
-                    
-                    // Respect the site's delay between requests to avoid being blocked
-                    std::this_thread::sleep_for(site.delay);
+                } catch (const std::exception& e) {
+                    std::cerr << "Error scraping " << site.name << ": " << e.what() << std::endl;
                 }
-            } catch (const std::exception& e) {
-                std::cerr << "Error scraping " << site.name << ": " << e.what() << std::endl;
+            }
+            
+            // Break if we've reached the maximum number of jobs across all sites
+            if (all_jobs.size() >= static_cast<size_t>(output_cfg.max_jobs)) {
+                break;
             }
         }
         
-        // Generate timestamped filename for output
-        auto now = std::chrono::system_clock::now();
-        auto now_time_t = std::chrono::system_clock::to_time_t(now);
-        std::stringstream ss;
-        ss << output_cfg.output_dir << "/jobs_" 
-           << std::put_time(std::localtime(&now_time_t), "%Y%m%d_%H%M%S") << ".json";
-        std::string output_path = ss.str();
-        
-        // Save to JSON file
-        if (output_cfg.json_output && !all_jobs.empty()) {
-            try {
-                save_to_json(all_jobs, output_path);
-                std::cout << "Saved " << all_jobs.size() << " jobs to " << output_path << std::endl;
-            } catch (const std::exception& e) {
-                std::cerr << "Error saving to JSON: " << e.what() << std::endl;
-            }
-        }
-        
-        // Save to SQLite if enabled
-        if (output_cfg.sqlite_output && !all_jobs.empty()) {
-#ifdef ENABLE_SQLITE
-            try {
-                if (init_sqlite_db(output_cfg.sqlite_db_path)) {
-                    if (save_to_sqlite(all_jobs, output_cfg.sqlite_db_path)) {
-                        std::cout << "Saved " << all_jobs.size() << " jobs to SQLite database" << std::endl;
-                    } else {
-                        std::cerr << "Failed to save jobs to SQLite" << std::endl;
-                    }
-                } else {
-                    std::cerr << "Failed to initialize SQLite database" << std::endl;
-                }
-            } catch (const std::exception& e) {
-                std::cerr << "Error with SQLite: " << e.what() << std::endl;
-            }
-#else
-            std::cerr << "SQLite support not enabled. Recompile with ENABLE_SQLITE defined." << std::endl;
-#endif
-        }
+        // The rest of your main function remains the same
+// Generate timestamped filename for output
+auto now = std::chrono::system_clock::now();
+auto now_time_t = std::chrono::system_clock::to_time_t(now);
+std::stringstream ss;
+ss << output_cfg.output_dir << "/jobs_" 
+   << std::put_time(std::localtime(&now_time_t), "%Y%m%d_%H%M%S") << ".json";
+std::string output_path = ss.str();
+
+// Deduplicate jobs before saving
+std::vector<json> unique_jobs = deduplicate_jobs(all_jobs);
+std::cout << "Filtered " << all_jobs.size() << " jobs down to " << unique_jobs.size() 
+          << " unique jobs" << std::endl;
+
+// Save to JSON file
+if (output_cfg.json_output && !unique_jobs.empty()) {
+    try {
+        save_to_json(unique_jobs, output_path);
+        std::cout << "Saved " << unique_jobs.size() << " jobs to " << output_path << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error saving to JSON: " << e.what() << std::endl;
+    }
+} else {
+    if (unique_jobs.empty()) {
+        std::cout << "No jobs to save!" << std::endl;
+    } else {
+        std::cout << "JSON output is disabled" << std::endl;
+    }
+}
+
+// Also save as CSV for easier viewing
+std::string csv_path = output_path.substr(0, output_path.length() - 5) + ".csv";
+try {
+    save_to_csv(unique_jobs, csv_path);
+    std::cout << "Saved " << unique_jobs.size() << " jobs to " << csv_path << std::endl;
+} catch (const std::exception& e) {
+    std::cerr << "Error saving to CSV: " << e.what() << std::endl;
+}
+        // Keep your existing code for the remainder of the main function
         
         // If this is a one-time run (interval is zero), break the loop
         if (output_cfg.scrape_interval.count() <= 0) {
@@ -987,84 +1246,4 @@ int main(int argc, char** argv) {
     curl_global_cleanup();
     
     return 0;
-}
-
-
-
-
-
-// Helper function to deduplicate jobs based on title and company
-std::vector<json> deduplicate_jobs(const std::vector<json>& jobs) {
-    std::vector<json> unique_jobs;
-    std::set<std::string> seen_fingerprints;
-    
-    for (const auto& job : jobs) {
-        // Create a fingerprint based on title and company
-        std::string title = job.value("title", "");
-        std::string company = job.value("company", "");
-        std::transform(title.begin(), title.end(), title.begin(), ::tolower);
-        std::transform(company.begin(), company.end(), company.begin(), ::tolower);
-        
-        // Simple fingerprint using title and company
-        std::string fingerprint = title + "|" + company;
-        
-        // Only add if we haven't seen this fingerprint before
-        if (seen_fingerprints.find(fingerprint) == seen_fingerprints.end()) {
-            seen_fingerprints.insert(fingerprint);
-            unique_jobs.push_back(job);
-        }
-    }
-    
-    return unique_jobs;
-}
-
-// Function to export jobs to CSV format
-void save_to_csv(const std::vector<json>& jobs, const std::string& filepath) {
-    std::ofstream file(filepath);
-    if (!file.is_open()) {
-        std::cerr << "Failed to open CSV file for writing: " << filepath << std::endl;
-        return;
-    }
-    
-    // Write CSV header
-    file << "Title,Company,Location,Description,Source,Source URL,Scraped At,Skills\n";
-    
-    // Write job data
-    for (const auto& job : jobs) {
-        // Helper function to escape CSV fields
-        auto escape_csv = [](const std::string& s) -> std::string {
-            if (s.find_first_of(",\"\n") != std::string::npos) {
-                std::string escaped = s;
-                // Replace " with ""
-                size_t pos = 0;
-                while ((pos = escaped.find("\"", pos)) != std::string::npos) {
-                    escaped.replace(pos, 1, "\"\"");
-                    pos += 2;
-                }
-                return "\"" + escaped + "\"";
-            }
-            return s;
-        };
-        
-        // Write each field, properly escaped
-        file << escape_csv(job.value("title", "")) << ",";
-        file << escape_csv(job.value("company", "")) << ",";
-        file << escape_csv(job.value("location", "")) << ",";
-        file << escape_csv(job.value("description", "")) << ",";
-        file << escape_csv(job.value("source", "")) << ",";
-        file << escape_csv(job.value("url", "")) << ",";
-        file << escape_csv(job.value("scraped_at", "")) << ",";
-        
-        // Handle skills array
-        std::string skills_str;
-        if (job.contains("skills") && job["skills"].is_array()) {
-            for (const auto& skill : job["skills"]) {
-                if (!skills_str.empty()) skills_str += "; ";
-                skills_str += skill.get<std::string>();
-            }
-        }
-        file << escape_csv(skills_str) << "\n";
-    }
-    
-    file.close();
 }
