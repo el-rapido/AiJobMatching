@@ -4,13 +4,13 @@ import json
 import argparse
 import subprocess
 import sqlite3
-from typing import List, Union, Dict, Any
+from typing import List, Union, Dict, Any, Optional
 
 
 class Embedder:
     """A class that handles text embedding using the Cohere API."""
 
-    def __init__(self, api_key: str = None):
+    def __init__(self, api_key: Optional[str] = None):
         """
         Initialize the Embedder with an API key.
         
@@ -207,18 +207,19 @@ def save_embedding(embedding: List[float], output_path: str) -> None:
         raise
 
 
-def filter_cv_with_ollama(raw_text: str, model: str = "gemma3:4b", output_dir: str = None) -> str:
+def filter_cv_with_ollama(raw_text: str, model: str = "gemma3:4b", output_dir: Optional[str] = None) -> str:
     """
     Filter CV text using Ollama with Gemma model.
     
     Args:
         raw_text: Raw CV text to filter
         model: Ollama model to use for filtering
-        output_dir: Directory to save filtered text output
+        output_dir: Directory to save filtered text output, can be None
         
     Returns:
         Filtered CV text
-    """
+        """
+    
     prompt = (
         "You are a professional CV parser. Extract and structure the following CV data for job matching:\n\n"
         "1. Professional Summary\n"
@@ -288,6 +289,80 @@ def filter_cv_with_ollama(raw_text: str, model: str = "gemma3:4b", output_dir: s
         print(f"[Filter] Falling back to using original text without filtering")
         return raw_text
 
+
+def extract_skills_with_ollama(description: str, model: str = "gemma3:4b") -> List[str]:
+    """
+    Extract skills from job description using Ollama with Gemma model.
+    
+    Args:
+        description: Job description text
+        model: Ollama model to use for skill extraction
+        
+    Returns:
+        List of extracted skills
+    """
+    prompt = (
+        "You are a professional job skills extractor. From the following job description, extract ONLY a list of technical "
+        "and soft skills required for this position.\n\n"
+        "Rules:\n"
+        "1. Return ONLY a list of skills, one per line\n"
+        "2. Do not include explanations, headers, or any text that is not a skill\n"
+        "3. Be specific and precise (e.g., 'Python' instead of 'Programming Languages')\n"
+        "4. Include both technical skills (e.g., 'Azure Synapse') and soft skills (e.g., 'Team Leadership')\n"
+        "5. Use consistent formatting, with each skill on its own line\n"
+        "6. If the same skill is mentioned multiple times, include it only once\n"
+        "7. Extract at most 30 skills\n\n"
+        "8. Return ONLY the skills in txt format, ONE per LINE without ANY explanations, asterisks or additional commentary AT ALL.\n\n"
+        f"Job Description:\n{description}"
+    )
+
+    try:
+        print("[SkillExtractor] Calling Ollama locally with Gemma...")
+        print(f"[SkillExtractor] Using model: {model}")
+        
+        # Use the encoding parameter with UTF-8 and errors='ignore' to handle problematic characters
+        result = subprocess.run(
+            ["ollama", "run", model],
+            input=prompt.encode('utf-8'),  # Encode input as UTF-8
+            capture_output=True,
+            timeout=120
+        )
+
+        # Decode output with error handling
+        skills_text = result.stdout.decode('utf-8', errors='ignore').strip()
+        
+        # Use a helper function to count newlines to avoid escape sequence in f-string
+        newline_count = skills_text.count('\n')
+        print(f"[SkillExtractor] Extraction complete. Found approximately {newline_count + 1} skills.")
+        
+        # Print debug preview of Gemma's output (first 200 chars)
+        print(f"[SkillExtractor] DEBUG - Gemma output preview (first 200 chars):")
+        print("-" * 50)
+        preview_text = skills_text[:200]
+        if len(skills_text) > 200:
+            preview_text += "..."
+        print(preview_text)
+        print("-" * 50)
+        
+        # Convert the output text to a list of skills
+        skills_list = [skill.strip() for skill in skills_text.split('\n') if skill.strip()]
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        skills_list = [skill for skill in skills_list if not (skill in seen or seen.add(skill))]
+        
+        print(f"[SkillExtractor] Extracted {len(skills_list)} unique skills.")
+        return skills_list
+
+    except subprocess.CalledProcessError as e:
+        print(f"[SkillExtractor] Ollama command failed: {e}")
+        print(f"[SkillExtractor] Stderr: {e.stderr.decode('utf-8', errors='ignore')}")
+        print(f"[SkillExtractor] Falling back to empty skills list")
+        return []
+    except Exception as e:
+        print(f"[SkillExtractor] Error calling Ollama: {str(e)}")
+        print(f"[SkillExtractor] Falling back to empty skills list")
+        return []  
 
 def load_job_json(file_path: str) -> Dict[str, Any]:
     """
@@ -442,6 +517,8 @@ def main():
     parser.add_argument("--job-file", type=str, help="JSON file containing job details")
     parser.add_argument("--job-dir", type=str, help="Directory containing multiple job JSON files")
     parser.add_argument("--db-path", type=str, help="Path to SQLite database for storing jobs with embeddings")
+    parser.add_argument("--skip-skills-extraction", action="store_true", help="Skip skills extraction from job description")
+    parser.add_argument("--gemma-model", type=str, default="gemma3:4b", help="Gemma model to use for text processing")
     
     args = parser.parse_args()
     
@@ -465,6 +542,10 @@ def main():
         print(f"[Embedder] Script directory: {script_dir}")
         print(f"[Embedder] Project root: {project_root}")
         
+        # Override the gemma model if specified
+        gemma_model = args.gemma_model
+        print(f"[Embedder] Using Gemma model: {gemma_model}")
+        
         embedder = Embedder(api_key)
         
         # Check if we're processing a CV
@@ -474,6 +555,10 @@ def main():
             print(f"[Embedder] Default CV output file: {default_output_file}")
             if args.save_filtered:
                 print(f"[Embedder] Filtered output directory: {filtered_output_dir}")
+            
+            # Initialize text variable to avoid "possibly unbound" errors
+            text = ""
+            raw_text = ""
             
             # Get input text
             if args.text:
@@ -489,17 +574,18 @@ def main():
                 raw_text = load_file_text(default_input_file)
             
             # Filter CV with Ollama if we loaded from a file and filtering is not skipped
-            if 'raw_text' in locals() and not args.skip_filter:
+            if raw_text and not args.skip_filter:
                 try:
                     # Set output directory for filtered text if save-filtered flag is set
-                    output_dir = filtered_output_dir if args.save_filtered else None
-                    text = filter_cv_with_ollama(raw_text, output_dir=output_dir)
+                    filter_output_dir = filtered_output_dir if args.save_filtered else None
+                    # Use the specified Gemma model if provided
+                    text = filter_cv_with_ollama(raw_text, model=gemma_model, output_dir=filter_output_dir)
                 except Exception as e:
                     print(f"[Embedder] Filtering failed, using original text: {str(e)}")
                     text = raw_text
                     
                     # Still save the original text if save-filtered flag is set
-                    if args.save_filtered:
+                    if args.save_filtered and raw_text:
                         try:
                             import datetime
                             os.makedirs(filtered_output_dir, exist_ok=True)
@@ -510,7 +596,7 @@ def main():
                             print(f"[Embedder] Saved original CV text to: {original_file}")
                         except Exception as save_error:
                             print(f"[Embedder] Warning: Could not save original text to file: {str(save_error)}")
-            elif 'raw_text' in locals() and args.skip_filter:
+            elif raw_text and args.skip_filter:
                 print("[Embedder] Skipping filtering step as requested")
                 text = raw_text
                 
@@ -527,19 +613,23 @@ def main():
                     except Exception as e:
                         print(f"[Embedder] Warning: Could not save original text to file: {str(e)}")
             
-            # Generate embedding
-            embedding = embedder.generate_embedding(text)
-            
-            # Print some info about the embedding
-            print(f"\n[Embedder] Embedding generated successfully!")
-            print(f"Embedding size: {len(embedding)} dimensions")
-            print(f"First 10 dimensions: {', '.join(map(str, embedding[:10]))}")
-            
-            # Determine output file path
-            output_path = args.output if args.output else default_output_file
-            
-            # Save embedding
-            save_embedding(embedding, output_path)
+            # Ensure text is not empty before generating embedding
+            if text:
+                # Generate embedding
+                embedding = embedder.generate_embedding(text)
+                
+                # Print some info about the embedding
+                print(f"\n[Embedder] Embedding generated successfully!")
+                print(f"Embedding size: {len(embedding)} dimensions")
+                print(f"First 10 dimensions: {', '.join(map(str, embedding[:10]))}")
+                
+                # Determine output file path
+                output_path = args.output if args.output else default_output_file
+                
+                # Save embedding
+                save_embedding(embedding, output_path)
+            else:
+                print("[Embedder] Error: No text provided for embedding generation")
         
         # Check if we're processing a single job file
         if args.job_file:
@@ -554,9 +644,10 @@ def main():
         exit(1)
 
 
+# Updated process_single_job function to respect skip-skills-extraction flag
 def process_single_job(args, embedder, default_db_path):
     """
-    Process a single job file, generate embedding, and save to database.
+    Process a single job file, extract skills, generate embedding, and save to database.
     
     Args:
         args: Command-line arguments
@@ -574,8 +665,54 @@ def process_single_job(args, embedder, default_db_path):
         
         # Process each job in the list
         for job in job_data:
+            if isinstance(job, dict):  # Ensure job is a dictionary
+                # Extract skills from job description if needed and not skipped
+                if (not job.get("skills") or len(job.get("skills", [])) == 0) and not args.skip_skills_extraction:
+                    description = job.get("description", "")
+                    if description:
+                        print("[Embedder] No skills found in job data, extracting skills from description...")
+                        extracted_skills = extract_skills_with_ollama(description, model=args.gemma_model)
+                        job["skills"] = extracted_skills
+                        print(f"[Embedder] Added {len(extracted_skills)} extracted skills to job data")
+                elif args.skip_skills_extraction and (not job.get("skills") or len(job.get("skills", [])) == 0):
+                    print("[Embedder] Skills extraction skipped, using empty skills list")
+                    job["skills"] = []
+                
+                # Format job data for embedding
+                formatted_job = format_job_for_embedding(job)
+                
+                # Generate embedding
+                embedding = embedder.generate_embedding(formatted_job)
+                
+                # Print some info about the embedding
+                print(f"\n[Embedder] Job embedding generated successfully!")
+                print(f"Embedding size: {len(embedding)} dimensions")
+                print(f"First 10 dimensions: {', '.join(map(str, embedding[:10]))}")
+                
+                # Determine database path
+                db_path = args.db_path if args.db_path else default_db_path
+                
+                # Save job with embedding to database
+                save_job_to_database(job, embedding, db_path)
+            else:
+                print(f"[Embedder] Warning: Expected dictionary for job data, but got {type(job).__name__}")
+    else:
+        # Process a single job object
+        if isinstance(job_data, dict):  # Ensure job_data is a dictionary
+            # Extract skills from job description if needed and not skipped
+            if (not job_data.get("skills") or len(job_data.get("skills", [])) == 0) and not args.skip_skills_extraction:
+                description = job_data.get("description", "")
+                if description:
+                    print("[Embedder] No skills found in job data, extracting skills from description...")
+                    extracted_skills = extract_skills_with_ollama(description, model=args.gemma_model)
+                    job_data["skills"] = extracted_skills
+                    print(f"[Embedder] Added {len(extracted_skills)} extracted skills to job data")
+            elif args.skip_skills_extraction and (not job_data.get("skills") or len(job_data.get("skills", [])) == 0):
+                print("[Embedder] Skills extraction skipped, using empty skills list")
+                job_data["skills"] = []
+            
             # Format job data for embedding
-            formatted_job = format_job_for_embedding(job)
+            formatted_job = format_job_for_embedding(job_data)
             
             # Generate embedding
             embedding = embedder.generate_embedding(formatted_job)
@@ -589,30 +726,15 @@ def process_single_job(args, embedder, default_db_path):
             db_path = args.db_path if args.db_path else default_db_path
             
             # Save job with embedding to database
-            save_job_to_database(job, embedding, db_path)
-    else:
-        # Process a single job object
-        # Format job data for embedding
-        formatted_job = format_job_for_embedding(job_data)
-        
-        # Generate embedding
-        embedding = embedder.generate_embedding(formatted_job)
-        
-        # Print some info about the embedding
-        print(f"\n[Embedder] Job embedding generated successfully!")
-        print(f"Embedding size: {len(embedding)} dimensions")
-        print(f"First 10 dimensions: {', '.join(map(str, embedding[:10]))}")
-        
-        # Determine database path
-        db_path = args.db_path if args.db_path else default_db_path
-        
-        # Save job with embedding to database
-        save_job_to_database(job_data, embedding, db_path)
+            save_job_to_database(job_data, embedding, db_path)
+        else:
+            print(f"[Embedder] Warning: Expected dictionary for job data, but got {type(job_data).__name__}")
 
 
+# Modified function to include extracted skills
 def process_job_directory(args, embedder, default_job_dir, default_db_path):
     """
-    Process all job files in a directory, generate embeddings, and save to database.
+    Process all job files in a directory, extract skills, generate embeddings, and save to database.
     
     Args:
         args: Command-line arguments
@@ -647,14 +769,29 @@ def process_job_directory(args, embedder, default_job_dir, default_db_path):
                 # Load job data from file
                 job_data = load_job_json(job_file_path)
                 
-                # Format job data for embedding
-                formatted_job = format_job_for_embedding(job_data)
-                
-                # Generate embedding
-                embedding = embedder.generate_embedding(formatted_job)
-                
-                # Save job with embedding to database
-                save_job_to_database(job_data, embedding, db_path)
+                if isinstance(job_data, dict):  # Ensure job_data is a dictionary
+                    # Extract skills from job description if needed and not skipped
+                    if (not job_data.get("skills") or len(job_data.get("skills", [])) == 0) and not args.skip_skills_extraction:
+                        description = job_data.get("description", "")
+                        if description:
+                            print("[Embedder] No skills found in job data, extracting skills from description...")
+                            extracted_skills = extract_skills_with_ollama(description, model=args.gemma_model)
+                            job_data["skills"] = extracted_skills
+                            print(f"[Embedder] Added {len(extracted_skills)} extracted skills to job data")
+                    elif args.skip_skills_extraction and (not job_data.get("skills") or len(job_data.get("skills", [])) == 0):
+                        print("[Embedder] Skills extraction skipped, using empty skills list")
+                        job_data["skills"] = []
+                    
+                    # Format job data for embedding
+                    formatted_job = format_job_for_embedding(job_data)
+                    
+                    # Generate embedding
+                    embedding = embedder.generate_embedding(formatted_job)
+                    
+                    # Save job with embedding to database
+                    save_job_to_database(job_data, embedding, db_path)
+                else:
+                    print(f"[Embedder] Warning: Expected dictionary for job data, but got {type(job_data).__name__}")
                 
             except Exception as e:
                 print(f"[Embedder] Error processing job file {job_file}: {str(e)}")
@@ -666,7 +803,6 @@ def process_job_directory(args, embedder, default_job_dir, default_db_path):
     except Exception as e:
         print(f"[Embedder] Error accessing job directory {job_dir}: {str(e)}")
         raise
-
 
 if __name__ == "__main__":
     main()

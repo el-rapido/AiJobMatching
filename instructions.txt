@@ -1,0 +1,3 @@
+To run CV processing: 
+To run Job Matching: .\Release\ai_job_matcher.exe --cv-file "..\data\sample_cv.txt"
+ python embedder.py --save-filtered 
