@@ -2804,7 +2804,7 @@ int main(int argc, char **argv)
         }
 
         // If this is a one-time run (interval is zero), break the loop
-        if (output_cfg.scrape_interval.count() <= 0)
+        if (true)
         {
             break;
         }
