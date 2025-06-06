@@ -1,0 +1,48 @@
+# Build directories
+/build/
+/data/
+/output/
+
+# General
+*.log
+*.tmp
+*.swp
+*.bak
+*.DS_Store
+*.idea
+*.vscode
+
+# Compiled source
+*.com
+*.class
+*.dll
+*.exe
+*.o
+*.so
+*.pyc
+__pycache__/
+
+# Packages
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+*.json
+
+# Dependency directories
+/node_modules/
+/bower_components/
+/.venv/
+/venv/
+/env/
+
+# Environment files
+.env
+.env.local
+.env.development
+.env.test
+.env.production
